@@ -1,13 +1,6 @@
 /**
  * REST channel adapter for NanoClaw.
  *
- * Source of truth lives in this nanopod repo (see docs/specs/rest_channel.md).
- * At deploy time the sync script drops this file into nanoclaw at
- * `src/channels/rest.ts`, where it self-registers via `registerChannelAdapter`.
- *
- * This module is built incrementally per the spec's task list. Task 6 covers
- * inbound body validation and InboundMessage emission. Outbound delivery,
- * lifecycle/ready, onMetadata and self-registration arrive in later tasks.
  */
 import { randomBytes } from 'node:crypto'
 import http from 'node:http'
@@ -24,6 +17,7 @@ const REST_ENV = {
   TRUSTED_HEADER_NAME: 'REST_TRUSTED_HEADER_NAME',
   TRUSTED_HEADER_VALUE: 'REST_TRUSTED_HEADER_VALUE',
   DEV_BEARER: 'REST_DEV_BEARER',
+  DISPLAY_NAME: 'NANOCLAW_DISPLAY_NAME',
 } as const
 import { registerChannelAdapter } from './channel-registry.js'
 
@@ -32,11 +26,12 @@ const ADAPTER_VERSION = '0.1.0' // POC; nanopod has no per-channel package.json
 export interface RestAdapterOptions {
   port: number
   messagesUrl: string
-  lifecycleReadyUrl: string
+  lifecycleReadyUrl: string | null
   outboundToken: string
   trustedHeaderName: string
   trustedHeaderValue: string
   devBearer: string | null
+  displayName?: string
 }
 
 // Inbound body validation — manual rather than Zod because nanoclaw (the
@@ -149,21 +144,26 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
           const presentedValue = req.headers[trustedHeaderKey]
           if (typeof presentedValue === 'string') {
             if (presentedValue !== opts.trustedHeaderValue) {
+              log.warn('rest inbound: trusted header mismatch — 401', { header: opts.trustedHeaderName })
               sendJson(res, 401, { error: 'Unauthorized' })
               return
             }
+            log.info('rest inbound: trusted header matched')
             // matched — fall through to handle the body
           } else {
-            // X-ExeDev-UserID absent: consult dev bearer fallback.
+            // trusted header absent: consult dev bearer fallback.
             if (opts.devBearer != null) {
               const auth = req.headers['authorization']
               if (typeof auth === 'string' && auth === `Bearer ${opts.devBearer}`) {
+                log.info('rest inbound: accepted via dev bearer')
                 // accepted via dev bearer — fall through
               } else {
+                log.warn('rest inbound: missing trusted header and invalid/absent dev bearer — 401')
                 sendJson(res, 401, { error: 'Unauthorized' })
                 return
               }
             } else {
+              log.warn('rest inbound: missing trusted header, no dev bearer configured — 401')
               sendJson(res, 401, { error: 'Unauthorized' })
               return
             }
@@ -200,13 +200,15 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
             timestamp: new Date().toISOString(),
           }
 
+          log.info('rest inbound: routing message', { messageId: body.messageId, contentLen: body.content.length })
           // Router-side throws should not tear down the HTTP server. The 202 is
           // emitted regardless — the message was accepted by the channel even
           // if downstream blew up. Mirrors emacs.ts posture.
           try {
             await setupConfig?.onInbound('rest:nanopod', null, inbound)
+            log.info('rest inbound: onInbound returned ok', { messageId: body.messageId })
           } catch (err) {
-            log.error('rest channel onInbound threw', { err: String(err) })
+            log.error('rest inbound: onInbound threw', { messageId: body.messageId, err: String(err) })
           }
 
           sendJson(res, 202, { messageId: body.messageId })
@@ -223,23 +225,29 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
       })()
     })
     await new Promise<void>((resolve) => server!.listen(opts.port, '0.0.0.0', resolve))
-
-    config.onMetadata('rest:nanopod', 'NanoPod', false)
-
-    // Lifecycle ready POST — failure is logged but not propagated. The channel
-    // is considered up once the listener is bound; the relay is informed on a
-    // best-effort basis.
-    const readyBody = JSON.stringify({
-      adapterVersion: ADAPTER_VERSION,
-      startedAt: new Date().toISOString(),
+    log.info('rest adapter listening', {
+      port: opts.port,
+      trustedHeader: opts.trustedHeaderName,
+      devBearer: opts.devBearer != null,
     })
-    try {
-      const status = await postJson(opts.lifecycleReadyUrl, readyBody, opts.outboundToken)
-      if (status < 200 || status >= 300) {
-        log.warn('rest channel: lifecycle/ready returned non-2xx', { url: opts.lifecycleReadyUrl, status })
+
+    config.onMetadata('rest:nanopod', opts.displayName ?? 'NanoPod', false)
+
+    // Lifecycle ready POST — optional, best-effort. The channel is considered
+    // up once the listener is bound regardless of whether the relay is notified.
+    if (opts.lifecycleReadyUrl !== null) {
+      const readyBody = JSON.stringify({
+        adapterVersion: ADAPTER_VERSION,
+        startedAt: new Date().toISOString(),
+      })
+      try {
+        const status = await postJson(opts.lifecycleReadyUrl, readyBody, opts.outboundToken)
+        if (status < 200 || status >= 300) {
+          log.warn('rest channel: lifecycle/ready returned non-2xx', { url: opts.lifecycleReadyUrl, status })
+        }
+      } catch (err) {
+        log.warn('rest channel: lifecycle/ready POST threw', { url: opts.lifecycleReadyUrl, error: String(err) })
       }
-    } catch (err) {
-      log.warn('rest channel: lifecycle/ready POST threw', { url: opts.lifecycleReadyUrl, error: String(err) })
     }
   }
 
@@ -302,11 +310,11 @@ export const restFactory: ChannelAdapterFactory = () => {
     REST_ENV.TRUSTED_HEADER_NAME,
     REST_ENV.TRUSTED_HEADER_VALUE,
     REST_ENV.DEV_BEARER,
+    REST_ENV.DISPLAY_NAME,
   ])
 
   const required: Record<string, string | undefined> = {
     [REST_ENV.MESSAGES_URL]: env[REST_ENV.MESSAGES_URL],
-    [REST_ENV.LIFECYCLE_READY_URL]: env[REST_ENV.LIFECYCLE_READY_URL],
     [REST_ENV.OUTBOUND_TOKEN]: env[REST_ENV.OUTBOUND_TOKEN],
     [REST_ENV.TRUSTED_HEADER_NAME]: env[REST_ENV.TRUSTED_HEADER_NAME],
     [REST_ENV.TRUSTED_HEADER_VALUE]: env[REST_ENV.TRUSTED_HEADER_VALUE],
@@ -327,11 +335,12 @@ export const restFactory: ChannelAdapterFactory = () => {
   return createRestAdapter({
     port,
     messagesUrl: env[REST_ENV.MESSAGES_URL]!,
-    lifecycleReadyUrl: env[REST_ENV.LIFECYCLE_READY_URL]!,
+    lifecycleReadyUrl: env[REST_ENV.LIFECYCLE_READY_URL] ?? null,
     outboundToken: env[REST_ENV.OUTBOUND_TOKEN]!,
     trustedHeaderName: env[REST_ENV.TRUSTED_HEADER_NAME]!,
     trustedHeaderValue: env[REST_ENV.TRUSTED_HEADER_VALUE]!,
     devBearer: env[REST_ENV.DEV_BEARER] ?? null,
+    displayName: env[REST_ENV.DISPLAY_NAME],
   })
 }
 
