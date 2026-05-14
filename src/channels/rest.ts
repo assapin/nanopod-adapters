@@ -4,6 +4,7 @@
  */
 import { randomBytes } from 'node:crypto'
 import http from 'node:http'
+import https from 'node:https'
 
 import { readEnvFile } from '../env.js'
 import { log } from '../log.js'
@@ -89,8 +90,9 @@ function extractText(content: unknown): string | undefined {
 
 async function postJson(url: string, body: string, token: string): Promise<number> {
   const u = new URL(url)
+  const requester = u.protocol === 'https:' ? https : http
   return new Promise((resolve, reject) => {
-    const req = http.request(
+    const req = requester.request(
       {
         hostname: u.hostname,
         port: u.port || (u.protocol === 'https:' ? 443 : 80),
