@@ -20,6 +20,7 @@
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { readEnvFile } from '../env.js'
+import { log } from '../log.js'
 
 function usage(): never {
   process.stderr.write(
@@ -147,6 +148,7 @@ async function main() {
   })
 
   await new Promise<void>((res) => server.listen(listenPort, '0.0.0.0', res))
+  log.info('rest-chat: listening', { port: listenPort, messagesPath, readyPath })
   process.stderr.write(
     `rest-chat: listening on :${listenPort} (messages=${messagesPath}${readyPath ? `, ready=${readyPath}` : ''})\n`,
   )
@@ -173,17 +175,20 @@ async function main() {
   try {
     sendStatus = await postJson(host, adapterPort, '/message', body, bearer)
   } catch (err) {
+    log.error('rest-chat: POST /message failed', { host, adapterPort, error: String(err) })
     process.stderr.write(`error: POST /message failed — ${String(err)}\n`)
     server.close()
     process.exit(1)
   }
 
   if (sendStatus < 200 || sendStatus >= 300) {
+    log.error('rest-chat: POST /message returned non-2xx', { host, adapterPort, status: sendStatus })
     process.stderr.write(`error: POST /message returned HTTP ${sendStatus}\n`)
     server.close()
     process.exit(1)
   }
 
+  log.info('rest-chat: message sent, waiting for reply', { messageId, host, adapterPort })
   process.stderr.write(`rest-chat: message sent (id=${messageId}), waiting for reply...\n`)
 
   const timeoutHandle = setTimeout(() => {
@@ -196,11 +201,13 @@ async function main() {
   clearTimeout(timeoutHandle)
   server.close()
 
+  log.info('rest-chat: reply received', { messageId })
   process.stdout.write(`${reply}\n`)
   process.exit(0)
 }
 
 main().catch((err) => {
+  log.error('rest-chat: fatal error', { error: String(err) })
   process.stderr.write(`fatal: ${String(err)}\n`)
   process.exit(1)
 })
