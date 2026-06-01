@@ -8,6 +8,11 @@ import https from 'node:https'
 
 import { readEnvFile } from '../env.js'
 import { log } from '../log.js'
+// Resolves an ask_question card's render (title + options) by questionId. In
+// nanopod this is a stub returning undefined; when rest.ts is synced into the
+// VM's nanoclaw the same relative import resolves to the real SQL-backed store
+// (pending_questions). Used by POST /action to decode a button index → value.
+import { getAskQuestionRender } from '../db/sessions.js'
 import type { ChannelAdapter, ChannelAdapterFactory, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js'
 
 const REST_ENV = {
@@ -123,6 +128,60 @@ function hasOutboundPayload(content: unknown, fileCount: number): boolean {
   return false
 }
 
+// `/action` body — a button click forwarded from the nanopod relay. `userId`
+// is informational (the clicker's platform id) and tolerated empty.
+interface ActionBody {
+  questionId: string
+  selectedOption: string
+  userId: string
+}
+
+function validateActionBody(parsed: unknown): { ok: true; data: ActionBody } | { ok: false; error: string } {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, error: 'body must be a JSON object' }
+  }
+  const obj = parsed as Record<string, unknown>
+  if (typeof obj.questionId !== 'string' || obj.questionId.length === 0) {
+    return { ok: false, error: 'questionId: must be a non-empty string' }
+  }
+  if (typeof obj.selectedOption !== 'string' || obj.selectedOption.length === 0) {
+    return { ok: false, error: 'selectedOption: must be a non-empty string' }
+  }
+  if (obj.userId !== undefined && typeof obj.userId !== 'string') {
+    return { ok: false, error: 'userId: must be a string' }
+  }
+  return {
+    ok: true,
+    data: {
+      questionId: obj.questionId,
+      selectedOption: obj.selectedOption,
+      userId: typeof obj.userId === 'string' ? obj.userId : '',
+    },
+  }
+}
+
+/**
+ * Decode the option value from a button-click `selectedOption`. nanopod's Chat
+ * SDK bridge encodes buttons by option INDEX (`ncq:<questionId>:<idx>`, kept
+ * short for Telegram's 64-byte callback_data cap), so the value arriving over
+ * `/action` is that index. Resolve it against the ask_question render — the
+ * same logic the native chat-sdk-bridge runs in-process. In nanopod the stubbed
+ * `getAskQuestionRender` returns `undefined` and we pass the value through; in
+ * the deployed VM the real SQL store (pending_questions) resolves it to the
+ * option's value. A non-numeric value (old-format card, or already a value)
+ * passes through unchanged.
+ */
+export function resolveSelectedOption(
+  render: { options: { value: string }[] } | undefined,
+  selectedOption: string,
+): string {
+  if (render && /^\d+$/.test(selectedOption)) {
+    const idx = Number(selectedOption)
+    if (render.options[idx]) return render.options[idx].value
+  }
+  return selectedOption
+}
+
 async function postJson(url: string, body: string, token: string): Promise<number> {
   const u = new URL(url)
   const requester = u.protocol === 'https:' ? https : http
@@ -158,6 +217,127 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
   // inbound handler and read by `deliver` below.
   let lastReplyContext: object | undefined
 
+  // Auth shared by both POST routes (/message, /action): the trusted header is
+  // authoritative when present; the dev bearer is consulted only when it's
+  // absent. Returns true when authorized; otherwise sends a 401 and returns
+  // false so the caller can bail.
+  function authorize(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+    const trustedHeaderKey = opts.trustedHeaderName.toLowerCase()
+    const presentedValue = req.headers[trustedHeaderKey]
+    if (typeof presentedValue === 'string') {
+      if (presentedValue !== opts.trustedHeaderValue) {
+        log.warn('rest inbound: trusted header mismatch — 401', { header: opts.trustedHeaderName })
+        sendJson(res, 401, { error: 'Unauthorized' })
+        return false
+      }
+      log.info('rest inbound: trusted header matched')
+      return true
+    }
+    if (opts.devBearer != null) {
+      const auth = req.headers['authorization']
+      if (typeof auth === 'string' && auth === `Bearer ${opts.devBearer}`) {
+        log.info('rest inbound: accepted via dev bearer')
+        return true
+      }
+      log.warn('rest inbound: missing trusted header and invalid/absent dev bearer — 401')
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return false
+    }
+    log.warn('rest inbound: missing trusted header, no dev bearer configured — 401')
+    sendJson(res, 401, { error: 'Unauthorized' })
+    return false
+  }
+
+  // POST /message — a chat/structured message from the relay → nanoclaw inbound.
+  async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const raw = await readBody(req)
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON' })
+      return
+    }
+    const result = validateInboundBody(parsed)
+    if (!result.ok) {
+      sendJson(res, 400, { error: result.error })
+      return
+    }
+    const body = result.data
+
+    // Capture replyContext for echo on subsequent outbound (T9 round-trip).
+    lastReplyContext = body.replyContext
+
+    // Structured content carries `text` + optional inline `attachments`
+    // (base64, opaque — nanoclaw decodes them). A legacy bare string
+    // collapses to `{ text }`. Either way the identity is forced to the
+    // bot identity below.
+    const text = typeof body.content === 'string' ? body.content : (extractText(body.content) ?? '')
+    const attachments =
+      typeof body.content === 'object' && Array.isArray(body.content.attachments) ? body.content.attachments : undefined
+
+    const inbound: InboundMessage = {
+      id: body.messageId,
+      // `chat-sdk` selects nanoclaw's rich inbound path; anything else
+      // (incl. legacy/no kind) is a plain chat message.
+      kind: body.kind === 'chat-sdk' ? 'chat-sdk' : 'chat',
+      // `senderId: 'nanopod'` (no colon) — nanoclaw's permissions module
+      // resolves this as `${channelType}:${rawHandle}` = `rest:nanopod`,
+      // matching the user registered at provisioning time. The relay is the
+      // wire conduit, not the user; for the single-conversation invariant
+      // the user identity collapses to the bot identity.
+      content: { text, sender: 'nanopod', senderId: 'nanopod', ...(attachments ? { attachments } : {}) },
+      timestamp: new Date().toISOString(),
+    }
+
+    log.info('rest inbound: routing message', { messageId: body.messageId, contentLen: text.length })
+    // Router-side throws should not tear down the HTTP server. The 202 is
+    // emitted regardless — the message was accepted by the channel even
+    // if downstream blew up. Mirrors emacs.ts posture.
+    try {
+      await setupConfig?.onInbound('rest:nanopod', null, inbound)
+      log.info('rest inbound: onInbound returned ok', { messageId: body.messageId })
+    } catch (err) {
+      log.error('rest inbound: onInbound threw', { messageId: body.messageId, err: String(err) })
+    }
+
+    sendJson(res, 202, { messageId: body.messageId })
+  }
+
+  // POST /action — a card button click forwarded from the relay. Decode the
+  // button index → option value against the VM's own ask_question render, then
+  // hand it to nanoclaw's onAction (which writes the question_response and wakes
+  // the agent). The relay carries only the index; the value lives here in the VM.
+  async function handleAction(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const raw = await readBody(req)
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      sendJson(res, 400, { error: 'Invalid JSON' })
+      return
+    }
+    const result = validateActionBody(parsed)
+    if (!result.ok) {
+      sendJson(res, 400, { error: result.error })
+      return
+    }
+    const { questionId, selectedOption, userId } = result.data
+
+    const render = getAskQuestionRender(questionId)
+    const value = resolveSelectedOption(render, selectedOption)
+    log.info('rest inbound: routing action', { questionId, resolved: value !== selectedOption })
+    // onAction is synchronous (void) in the ChannelSetup contract; guard against
+    // a host throw so it can't tear down the listener.
+    try {
+      setupConfig?.onAction(questionId, value, userId)
+    } catch (err) {
+      log.error('rest inbound: onAction threw', { questionId, err: String(err) })
+    }
+
+    sendJson(res, 202, { questionId })
+  }
+
   const setup = async (config: ChannelSetup): Promise<void> => {
     setupConfig = config
     server = http.createServer((req, res) => {
@@ -165,7 +345,8 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
       void (async () => {
         try {
           const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`)
-          if (url.pathname !== '/message') {
+          const pathname = url.pathname
+          if (pathname !== '/message' && pathname !== '/action') {
             res.statusCode = 404
             res.end()
             return
@@ -175,92 +356,13 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
             res.end()
             return
           }
-          // Auth: trusted header is authoritative when present.
-          // Dev bearer fallback is only consulted when the trusted header is absent.
-          const trustedHeaderKey = opts.trustedHeaderName.toLowerCase()
-          const presentedValue = req.headers[trustedHeaderKey]
-          if (typeof presentedValue === 'string') {
-            if (presentedValue !== opts.trustedHeaderValue) {
-              log.warn('rest inbound: trusted header mismatch — 401', { header: opts.trustedHeaderName })
-              sendJson(res, 401, { error: 'Unauthorized' })
-              return
-            }
-            log.info('rest inbound: trusted header matched')
-            // matched — fall through to handle the body
+          if (!authorize(req, res)) return
+
+          if (pathname === '/message') {
+            await handleMessage(req, res)
           } else {
-            // trusted header absent: consult dev bearer fallback.
-            if (opts.devBearer != null) {
-              const auth = req.headers['authorization']
-              if (typeof auth === 'string' && auth === `Bearer ${opts.devBearer}`) {
-                log.info('rest inbound: accepted via dev bearer')
-                // accepted via dev bearer — fall through
-              } else {
-                log.warn('rest inbound: missing trusted header and invalid/absent dev bearer — 401')
-                sendJson(res, 401, { error: 'Unauthorized' })
-                return
-              }
-            } else {
-              log.warn('rest inbound: missing trusted header, no dev bearer configured — 401')
-              sendJson(res, 401, { error: 'Unauthorized' })
-              return
-            }
+            await handleAction(req, res)
           }
-
-          // Read and parse body.
-          const raw = await readBody(req)
-          let parsed: unknown
-          try {
-            parsed = JSON.parse(raw)
-          } catch {
-            sendJson(res, 400, { error: 'Invalid JSON' })
-            return
-          }
-          const result = validateInboundBody(parsed)
-          if (!result.ok) {
-            sendJson(res, 400, { error: result.error })
-            return
-          }
-          const body = result.data
-
-          // Capture replyContext for echo on subsequent outbound (T9 round-trip).
-          lastReplyContext = body.replyContext
-
-          // Structured content carries `text` + optional inline `attachments`
-          // (base64, opaque — nanoclaw decodes them). A legacy bare string
-          // collapses to `{ text }`. Either way the identity is forced to the
-          // bot identity below.
-          const text = typeof body.content === 'string' ? body.content : (extractText(body.content) ?? '')
-          const attachments =
-            typeof body.content === 'object' && Array.isArray(body.content.attachments)
-              ? body.content.attachments
-              : undefined
-
-          const inbound: InboundMessage = {
-            id: body.messageId,
-            // `chat-sdk` selects nanoclaw's rich inbound path; anything else
-            // (incl. legacy/no kind) is a plain chat message.
-            kind: body.kind === 'chat-sdk' ? 'chat-sdk' : 'chat',
-            // `senderId: 'nanopod'` (no colon) — nanoclaw's permissions module
-            // resolves this as `${channelType}:${rawHandle}` = `rest:nanopod`,
-            // matching the user registered at provisioning time. The relay is the
-            // wire conduit, not the user; for the single-conversation invariant
-            // the user identity collapses to the bot identity.
-            content: { text, sender: 'nanopod', senderId: 'nanopod', ...(attachments ? { attachments } : {}) },
-            timestamp: new Date().toISOString(),
-          }
-
-          log.info('rest inbound: routing message', { messageId: body.messageId, contentLen: text.length })
-          // Router-side throws should not tear down the HTTP server. The 202 is
-          // emitted regardless — the message was accepted by the channel even
-          // if downstream blew up. Mirrors emacs.ts posture.
-          try {
-            await setupConfig?.onInbound('rest:nanopod', null, inbound)
-            log.info('rest inbound: onInbound returned ok', { messageId: body.messageId })
-          } catch (err) {
-            log.error('rest inbound: onInbound threw', { messageId: body.messageId, err: String(err) })
-          }
-
-          sendJson(res, 202, { messageId: body.messageId })
         } catch (err) {
           log.error('rest channel request handler error', { err: String(err) })
           if (!res.headersSent) {
