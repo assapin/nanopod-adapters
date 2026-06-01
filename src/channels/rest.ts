@@ -38,9 +38,14 @@ export interface RestAdapterOptions {
 // Inbound body validation — manual rather than Zod because nanoclaw (the
 // deploy target) doesn't depend on Zod. Keeping source and deploy copies
 // byte-identical so the sync script is a pure file copy with no rewrites.
+//
+// `content` may be a structured object (evolved wire: `{ text, attachments? }`,
+// attachments inline base64) or a bare non-empty string (legacy server). `kind`
+// is optional and rides through to the nanoclaw InboundMessage.
 interface InboundBody {
   messageId: string
-  content: string
+  content: string | Record<string, unknown>
+  kind?: string
   replyContext?: Record<string, unknown>
 }
 
@@ -54,8 +59,17 @@ function validateInboundBody(parsed: unknown): ValidationResult {
   if (typeof obj.messageId !== 'string' || obj.messageId.length === 0) {
     return { ok: false, error: 'messageId: must be a non-empty string' }
   }
-  if (typeof obj.content !== 'string' || obj.content.length === 0) {
-    return { ok: false, error: 'content: must be a non-empty string' }
+  const contentIsString = typeof obj.content === 'string'
+  const contentIsObject = typeof obj.content === 'object' && obj.content !== null && !Array.isArray(obj.content)
+  if (contentIsString) {
+    if ((obj.content as string).length === 0) {
+      return { ok: false, error: 'content: must be a non-empty string' }
+    }
+  } else if (!contentIsObject) {
+    return { ok: false, error: 'content: must be a string or object' }
+  }
+  if (obj.kind !== undefined && typeof obj.kind !== 'string') {
+    return { ok: false, error: 'kind: must be a string' }
   }
   let replyContext: Record<string, unknown> | undefined
   if (obj.replyContext !== undefined) {
@@ -64,7 +78,15 @@ function validateInboundBody(parsed: unknown): ValidationResult {
     }
     replyContext = obj.replyContext as Record<string, unknown>
   }
-  return { ok: true, data: { messageId: obj.messageId, content: obj.content, replyContext } }
+  return {
+    ok: true,
+    data: {
+      messageId: obj.messageId,
+      content: obj.content as string | Record<string, unknown>,
+      kind: obj.kind as string | undefined,
+      replyContext,
+    },
+  }
 }
 
 async function readBody(req: http.IncomingMessage): Promise<string> {
@@ -86,6 +108,19 @@ function extractText(content: unknown): string | undefined {
     if (typeof text === 'string') return text
   }
   return undefined
+}
+
+// Whether an outbound message carries anything worth POSTing. A bare empty
+// chat (`{ text: '' }` with no files) is dropped; a file-only message, or a
+// content object with any other non-empty field (markdown, type, emoji,
+// options…), is delivered.
+function hasOutboundPayload(content: unknown, fileCount: number): boolean {
+  if (fileCount > 0) return true
+  if (typeof content === 'string') return content.length > 0
+  if (content !== null && typeof content === 'object') {
+    return Object.values(content).some((v) => (typeof v === 'string' ? v.length > 0 : v != null))
+  }
+  return false
 }
 
 async function postJson(url: string, body: string, token: string): Promise<number> {
@@ -190,19 +225,31 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
           // Capture replyContext for echo on subsequent outbound (T9 round-trip).
           lastReplyContext = body.replyContext
 
+          // Structured content carries `text` + optional inline `attachments`
+          // (base64, opaque — nanoclaw decodes them). A legacy bare string
+          // collapses to `{ text }`. Either way the identity is forced to the
+          // bot identity below.
+          const text = typeof body.content === 'string' ? body.content : (extractText(body.content) ?? '')
+          const attachments =
+            typeof body.content === 'object' && Array.isArray(body.content.attachments)
+              ? body.content.attachments
+              : undefined
+
           const inbound: InboundMessage = {
             id: body.messageId,
-            kind: 'chat',
+            // `chat-sdk` selects nanoclaw's rich inbound path; anything else
+            // (incl. legacy/no kind) is a plain chat message.
+            kind: body.kind === 'chat-sdk' ? 'chat-sdk' : 'chat',
             // `senderId: 'nanopod'` (no colon) — nanoclaw's permissions module
             // resolves this as `${channelType}:${rawHandle}` = `rest:nanopod`,
             // matching the user registered at provisioning time. The relay is the
             // wire conduit, not the user; for the single-conversation invariant
             // the user identity collapses to the bot identity.
-            content: { text: body.content, sender: 'nanopod', senderId: 'nanopod' },
+            content: { text, sender: 'nanopod', senderId: 'nanopod', ...(attachments ? { attachments } : {}) },
             timestamp: new Date().toISOString(),
           }
 
-          log.info('rest inbound: routing message', { messageId: body.messageId, contentLen: body.content.length })
+          log.info('rest inbound: routing message', { messageId: body.messageId, contentLen: text.length })
           // Router-side throws should not tear down the HTTP server. The 202 is
           // emitted regardless — the message was accepted by the channel even
           // if downstream blew up. Mirrors emacs.ts posture.
@@ -272,13 +319,19 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
       log.warn('rest channel: ignoring deliver for non-nanopod platformId', { platformId })
       return undefined
     }
-    const text = extractText(message.content)
-    if (text === undefined || text === '') return undefined
+    const fileCount = message.files?.length ?? 0
+    if (!hasOutboundPayload(message.content, fileCount)) return undefined
+
+    // Forward content + kind verbatim; encode each file Buffer to base64 for
+    // the JSON wire (decoded back to a Buffer on the relay side).
+    const files = message.files?.map((f) => ({ filename: f.filename, data: f.data.toString('base64') }))
 
     const messageId = `rest-out-${Date.now()}-${randomBytes(4).toString('hex')}`
     const body = JSON.stringify({
       messageId,
-      content: text,
+      kind: message.kind,
+      content: message.content,
+      ...(files && files.length > 0 ? { files } : {}),
       ...(lastReplyContext !== undefined ? { replyContext: lastReplyContext } : {}),
     })
     try {
