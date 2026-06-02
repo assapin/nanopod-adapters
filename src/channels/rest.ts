@@ -94,6 +94,21 @@ function validateInboundBody(parsed: unknown): ValidationResult {
   }
 }
 
+// Pull the platform message id out of the relay's outbound-POST response
+// (`{ platformMessageId }`). Tolerant: any parse/shape problem yields undefined
+// so `deliver` falls back to the synthetic id rather than throwing.
+function parsePlatformMessageId(respBody: string): string | undefined {
+  if (!respBody) return undefined
+  try {
+    const parsed = JSON.parse(respBody) as { platformMessageId?: unknown }
+    return typeof parsed.platformMessageId === 'string' && parsed.platformMessageId.length > 0
+      ? parsed.platformMessageId
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
 async function readBody(req: http.IncomingMessage): Promise<string> {
   const chunks: Buffer[] = []
   for await (const chunk of req) chunks.push(chunk as Buffer)
@@ -182,7 +197,7 @@ export function resolveSelectedOption(
   return selectedOption
 }
 
-async function postJson(url: string, body: string, token: string): Promise<number> {
+async function postJson(url: string, body: string, token: string): Promise<{ status: number; body: string }> {
   const u = new URL(url)
   const requester = u.protocol === 'https:' ? https : http
   return new Promise((resolve, reject) => {
@@ -199,9 +214,12 @@ async function postJson(url: string, body: string, token: string): Promise<numbe
         },
       },
       (res) => {
-        // Drain body so the socket can be reused / closed cleanly.
-        res.on('data', () => {})
-        res.on('end', () => resolve(res.statusCode ?? 0))
+        // Read the response body — the relay echoes the platform message id
+        // (`{ platformMessageId }`) so `deliver` can return the real id for the
+        // agent's `delivered` table instead of the local placeholder.
+        const chunks: Buffer[] = []
+        res.on('data', (c: Buffer) => chunks.push(c))
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }))
       },
     )
     req.on('error', reject)
@@ -275,6 +293,17 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
     const text = typeof body.content === 'string' ? body.content : (extractText(body.content) ?? '')
     const attachments =
       typeof body.content === 'object' && Array.isArray(body.content.attachments) ? body.content.attachments : undefined
+    // Reply context (the message the user replied to): the relay carries it on
+    // the structured `content.replyTo` ({ id?, text, sender }). Pass it through
+    // opaquely — nanoclaw's formatter renders `replyTo` as a `<quoted_message>`
+    // (and `reply_to=` when `id` is present). Dropped for bare-string content.
+    const replyTo =
+      typeof body.content === 'object' &&
+      body.content.replyTo !== null &&
+      typeof body.content.replyTo === 'object' &&
+      !Array.isArray(body.content.replyTo)
+        ? body.content.replyTo
+        : undefined
 
     const inbound: InboundMessage = {
       id: body.messageId,
@@ -286,7 +315,13 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
       // matching the user registered at provisioning time. The relay is the
       // wire conduit, not the user; for the single-conversation invariant
       // the user identity collapses to the bot identity.
-      content: { text, sender: 'nanopod', senderId: 'nanopod', ...(attachments ? { attachments } : {}) },
+      content: {
+        text,
+        sender: 'nanopod',
+        senderId: 'nanopod',
+        ...(attachments ? { attachments } : {}),
+        ...(replyTo ? { replyTo } : {}),
+      },
       timestamp: new Date().toISOString(),
     }
 
@@ -392,7 +427,7 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
         startedAt: new Date().toISOString(),
       })
       try {
-        const status = await postJson(opts.lifecycleReadyUrl, readyBody, opts.outboundToken)
+        const { status } = await postJson(opts.lifecycleReadyUrl, readyBody, opts.outboundToken)
         if (status < 200 || status >= 300) {
           log.warn('rest channel: lifecycle/ready returned non-2xx', { url: opts.lifecycleReadyUrl, status })
         }
@@ -437,8 +472,17 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
       ...(lastReplyContext !== undefined ? { replyContext: lastReplyContext } : {}),
     })
     try {
-      const status = await postJson(opts.messagesUrl, body, opts.outboundToken)
-      if (status >= 200 && status < 300) return messageId
+      const { status, body: respBody } = await postJson(opts.messagesUrl, body, opts.outboundToken)
+      if (status >= 200 && status < 300) {
+        // Prefer the platform (Discord) message id the relay echoes back: that's
+        // the id the agent must target to react to / edit THIS message later.
+        // nanoclaw records our return value in `delivered.platform_message_id`,
+        // so returning the synthetic `messageId` would make self-targeted
+        // reactions/edits resolve to a non-existent id (Discord 404). Fall back
+        // to the synthetic id only when the relay omits the platform id.
+        const platformMessageId = parsePlatformMessageId(respBody)
+        return platformMessageId ?? messageId
+      }
       log.error('rest channel: outbound POST failed', { url: opts.messagesUrl, status })
       return undefined
     } catch (err) {
