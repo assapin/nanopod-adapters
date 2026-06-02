@@ -143,6 +143,24 @@ function hasOutboundPayload(content: unknown, fileCount: number): boolean {
   return false
 }
 
+// nanoclaw stores inbound platform ids as `<platform-id>:ag-<group>` (the agent
+// group id appended for routing), and `getMessageIdBySeq` hands that composite to
+// reaction/edit ops. The platform's API wants the BARE id, and this adapter is the
+// platform-id boundary: inbound it gives nanoclaw the bare id, so outbound it strips
+// the `:ag-<group>` suffix back off. Targets ONLY that suffix, so it's
+// platform-agnostic — Discord `<snowflake>:ag-…` → `<snowflake>`, Telegram
+// `<chat>:<msg>:ag-…` → `<chat>:<msg>`. The bot's own messages resolve to a bare id
+// (no suffix) → no-op.
+function stripGroupSuffix(content: unknown): unknown {
+  if (content === null || typeof content !== 'object') return content
+  const c = content as Record<string, unknown>
+  if ((c.operation === 'reaction' || c.operation === 'edit') && typeof c.messageId === 'string') {
+    const bare = c.messageId.replace(/:ag-[\w-]+$/, '')
+    if (bare !== c.messageId) return { ...c, messageId: bare }
+  }
+  return content
+}
+
 // `/action` body — a button click forwarded from the nanopod relay. `userId`
 // is informational (the clicker's platform id) and tolerated empty.
 interface ActionBody {
@@ -467,7 +485,9 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
     const body = JSON.stringify({
       messageId,
       kind: message.kind,
-      content: message.content,
+      // Strip nanoclaw's `:ag-<group>` suffix off reaction/edit target ids so the
+      // host posts to the bare platform message id (see stripGroupSuffix).
+      content: stripGroupSuffix(message.content),
       ...(files && files.length > 0 ? { files } : {}),
       ...(lastReplyContext !== undefined ? { replyContext: lastReplyContext } : {}),
     })
