@@ -38,6 +38,11 @@ export interface RestAdapterOptions {
   trustedHeaderValue: string
   devBearer: string | null
   displayName?: string
+  // Backoff waits between outbound-POST retries; attempts = length + 1. Retries
+  // cover 5xx and network errors only (a relay restart or edge blip must not
+  // cost the user a reply); 4xx is permanent and never retried. Kept short and
+  // bounded: the process may itself restart, and an in-memory queue dies with it.
+  outboundRetryBackoffMs?: number[]
 }
 
 // Inbound body validation — manual rather than Zod because nanoclaw (the
@@ -491,23 +496,35 @@ export function createRestAdapter(opts: RestAdapterOptions): ChannelAdapter {
       ...(files && files.length > 0 ? { files } : {}),
       ...(lastReplyContext !== undefined ? { replyContext: lastReplyContext } : {}),
     })
-    try {
-      const { status, body: respBody } = await postJson(opts.messagesUrl, body, opts.outboundToken)
-      if (status >= 200 && status < 300) {
-        // Prefer the platform (Discord) message id the relay echoes back: that's
-        // the id the agent must target to react to / edit THIS message later.
-        // nanoclaw records our return value in `delivered.platform_message_id`,
-        // so returning the synthetic `messageId` would make self-targeted
-        // reactions/edits resolve to a non-existent id (Discord 404). Fall back
-        // to the synthetic id only when the relay omits the platform id.
-        const platformMessageId = parsePlatformMessageId(respBody)
-        return platformMessageId ?? messageId
+    const backoffs = opts.outboundRetryBackoffMs ?? [1_000, 5_000]
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const { status, body: respBody } = await postJson(opts.messagesUrl, body, opts.outboundToken)
+        if (status >= 200 && status < 300) {
+          // Prefer the platform (Discord) message id the relay echoes back: that's
+          // the id the agent must target to react to / edit THIS message later.
+          // nanoclaw records our return value in `delivered.platform_message_id`,
+          // so returning the synthetic `messageId` would make self-targeted
+          // reactions/edits resolve to a non-existent id (Discord 404). Fall back
+          // to the synthetic id only when the relay omits the platform id.
+          const platformMessageId = parsePlatformMessageId(respBody)
+          return platformMessageId ?? messageId
+        }
+        // 4xx is permanent (the relay rejected the payload); 5xx is the relay or
+        // its edge having a moment — retry those on the backoff schedule.
+        if (status < 500 || attempt > backoffs.length) {
+          log.error('rest channel: outbound POST failed', { url: opts.messagesUrl, status, attempt })
+          return undefined
+        }
+        log.warn('rest channel: outbound POST got 5xx — will retry', { status, attempt })
+      } catch (err) {
+        if (attempt > backoffs.length) {
+          log.error('rest channel: outbound POST threw', { url: opts.messagesUrl, error: String(err), attempt })
+          return undefined
+        }
+        log.warn('rest channel: outbound POST threw — will retry', { error: String(err), attempt })
       }
-      log.error('rest channel: outbound POST failed', { url: opts.messagesUrl, status })
-      return undefined
-    } catch (err) {
-      log.error('rest channel: outbound POST threw', { url: opts.messagesUrl, error: String(err) })
-      return undefined
+      await new Promise((r) => setTimeout(r, backoffs[attempt - 1]))
     }
   }
 
